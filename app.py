@@ -4,8 +4,21 @@ Stock Price Projection Dashboard
 Run with:
     streamlit run stock_projection_dashboard.py
 
-Requirements:
-    pip install streamlit yfinance pandas plotly
+Deploying (GitHub + Streamlit Community Cloud): commit requirements.txt and
+.streamlit/config.toml (both provided alongside this file) to the same repo.
+Without requirements.txt, Streamlit Cloud resolves its own package versions,
+which can silently differ from what this file was built and tested against.
+Without config.toml, the app follows the *viewer's* browser/OS light-or-dark
+preference rather than this app's own light-mode design.
+
+A note on live data on a cloud host: Yahoo Finance rate-limits requests from
+shared cloud IP ranges (Streamlit Cloud, AWS, etc.) more aggressively than
+from a home connection, so "Too Many Requests" errors are common and not a
+bug in this file. Every fetched field (current price, EPS TTM, current P/E)
+is an editable input specifically so the tool stays fully usable by typing
+values in yourself when that happens — see fetch_quote()'s docstring below.
+
+Requirements: see requirements.txt (streamlit, yfinance, pandas, plotly).
 
 Optional — lets Saved Projections sync across devices/restarts via Google Sheets
 (otherwise everything falls back to a local SQLite file next to this script):
@@ -19,12 +32,15 @@ Optional — lets Saved Projections sync across devices/restarts via Google Shee
 Data source: Yahoo Finance via yfinance. Educational tool, not investment advice.
 """
 
+import re
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -313,27 +329,94 @@ def _safe_float(v):
         return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def _friendly_fetch_error(exc: Exception) -> str:
+    """Yahoo Finance rate-limits shared cloud IPs (Streamlit Cloud, AWS, etc.)
+    much harder than a home connection, so 'Too Many Requests' is common on
+    a deployed app and isn't a bug here. Translate the raw exception into
+    something a user can actually act on instead of showing a stack-trace
+    style message as the status text."""
+    msg = str(exc)
+    if re.search(r"429|too many requests|rate.?limit", msg, re.IGNORECASE):
+        return "Yahoo is rate-limiting this server right now"
+    return "Live fetch failed"
+
+
+def _yf_session():
+    # A missing/generic User-Agent is one of the easiest "this is a bot"
+    # signals a server can check — sending one that looks like an ordinary
+    # browser is standard, legitimate practice for any HTTP client, not a
+    # way of evading a rate limit once one is actually in effect.
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    })
+    return s
+
+
+def _quote_cache_db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""CREATE TABLE IF NOT EXISTS quote_cache (
+        ticker TEXT PRIMARY KEY, fetched_at TEXT NOT NULL,
+        company TEXT, price REAL, eps REAL, pe REAL
+    )""")
+    con.commit()
+    return con
+
+
+def _quote_cache_get(ticker):
+    con = _quote_cache_db()
+    row = con.execute(
+        "SELECT fetched_at, company, price, eps, pe FROM quote_cache WHERE ticker=?", (ticker,)
+    ).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"fetched_at": row[0], "company": row[1], "price": row[2], "eps": row[3], "pe": row[4]}
+
+
+def _quote_cache_set(ticker, q):
+    con = _quote_cache_db()
+    con.execute(
+        """INSERT INTO quote_cache (ticker, fetched_at, company, price, eps, pe) VALUES (?,?,?,?,?,?)
+           ON CONFLICT(ticker) DO UPDATE SET
+             fetched_at=excluded.fetched_at, company=excluded.company,
+             price=excluded.price, eps=excluded.eps, pe=excluded.pe""",
+        (ticker, datetime.now().isoformat(timespec="seconds"), q["company"], q["price"], q["eps"], q["pe"]),
+    )
+    con.commit()
+    con.close()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_quote(ticker: str):
-    t = yf.Ticker(ticker)
-    info = t.info or {}
-    price = _safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
-    if price is None:
-        hist = t.history(period="5d")
-        if not hist.empty:
-            price = _safe_float(hist["Close"].dropna().iloc[-1])
-    return {
-        "ticker": ticker.upper(),
-        "company": info.get("longName") or info.get("shortName") or ticker.upper(),
-        "price": price,
-        "eps": _safe_float(info.get("trailingEps")),
-        "pe": _safe_float(info.get("trailingPE")),
-    }
+    last_exc = None
+    for attempt in range(2):  # one retry — a real rate-limit ban needs minutes to clear,
+        try:                  # not milliseconds, so more attempts than this wouldn't help
+            t = yf.Ticker(ticker, session=_yf_session())
+            info = t.info or {}
+            price = _safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+            if price is None:
+                hist = t.history(period="5d")
+                if not hist.empty:
+                    price = _safe_float(hist["Close"].dropna().iloc[-1])
+            return {
+                "ticker": ticker.upper(),
+                "company": info.get("longName") or info.get("shortName") or ticker.upper(),
+                "price": price,
+                "eps": _safe_float(info.get("trailingEps")),
+                "pe": _safe_float(info.get("trailingPE")),
+            }
+        except Exception as e:
+            last_exc = e
+            if attempt == 0:
+                time.sleep(1.5)
+    raise last_exc
 
 
 def _annual_series(ticker, row_candidates):
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=_yf_session())
         inc = t.income_stmt
         if inc is None or inc.empty:
             return None
@@ -475,6 +558,9 @@ def load_saved_row(row):
     pe_high_val = float(pe_high_val) if pe_high_val not in (None, "") and not pd.isna(pe_high_val) else pe_low_val
     st.session_state[f"pelow_in_{tok}"] = pe_low_val
     st.session_state[f"pehigh_in_{tok}"] = pe_high_val
+    cur_price = _safe_float(row.get("current_price") if hasattr(row, "get") else row["current_price"])
+    if cur_price is not None:
+        st.session_state[f"curprice_in_{tok}"] = cur_price
     st.rerun()
 
 
@@ -545,25 +631,47 @@ ticker = st.session_state.ticker
 # Fetch data (graceful on failure — never hard-stops the app)
 # ---------------------------------------------------------------------------
 fetch_error = None
+cache_age = None
 try:
     quote = fetch_quote(ticker)
+    _quote_cache_set(ticker, quote)
 except Exception as e:
-    quote = {"ticker": ticker, "company": ticker, "price": None, "eps": None, "pe": None}
-    fetch_error = str(e)
+    cached = _quote_cache_get(ticker)
+    if cached and cached["price"] is not None:
+        quote = {"ticker": ticker, "company": cached["company"], "price": cached["price"],
+                  "eps": cached["eps"], "pe": cached["pe"]}
+        cache_age = cached["fetched_at"]
+    else:
+        quote = {"ticker": ticker, "company": ticker, "price": None, "eps": None, "pe": None}
+    fetch_error = _friendly_fetch_error(e)
 
 try:
-    hist = fetch_historical_cagr(ticker) if fetch_error is None else {"rev": {1: None, 3: None, 4: None}, "eps": {1: None, 3: None, 4: None}}
+    hist = fetch_historical_cagr(ticker)
 except Exception:
     hist = {"rev": {1: None, 3: None, 4: None}, "eps": {1: None, 3: None, 4: None}}
 
 live = fetch_error is None and quote["price"] is not None
 
+# reset_token is needed now (not just further down) so the hero can reflect
+# a manual Current Price override already sitting in session_state before
+# that input widget itself has been drawn yet further down the page.
+tok = st.session_state.reset_token
+_price_override = st.session_state.get(f"curprice_in_{tok}")
+if _price_override is not None:
+    quote["price"] = _price_override
+
 # ---------------------------------------------------------------------------
 # Hero card
 # ---------------------------------------------------------------------------
 price_display = fmt_money(quote["price"]) if quote["price"] is not None else "—"
-status_class = "live" if live else "fallback"
-status_text = "● Live from Yahoo Finance" if live else f"● {fetch_error or 'Price unavailable — check the ticker and try again'}"
+if live:
+    status_class, status_text = "live", "● Live from Yahoo Finance"
+elif cache_age and _price_override is None:
+    status_class, status_text = "fallback", f"● {fetch_error} — showing cached data from {cache_age[11:16]}"
+elif _price_override is not None:
+    status_class, status_text = "fallback", "● Using your entered values"
+else:
+    status_class, status_text = "fallback", f"● {fetch_error or 'No data yet'} — enter values manually below"
 
 with st.container(key="hero-card"):
     col_info, col_save = st.columns([4, 1])
@@ -597,15 +705,36 @@ years = st.slider("Projection horizon", 1, 10, key="years", format="%d years")
 # ---------------------------------------------------------------------------
 # Two-column cards
 # ---------------------------------------------------------------------------
-tok = st.session_state.reset_token
 left, right = st.columns(2, gap="large")
 
 with left:
     with st.container(border=True, key="metrics-card"):
         st.markdown("##### CURRENT METRICS")
         m1, m2 = st.columns(2)
-        m1.metric("EPS TTM", fmt_money(quote["eps"]) if quote["eps"] is not None else "—")
-        m2.metric("Current P/E", f"{quote['pe']:.1f}" if quote["pe"] is not None else "—")
+        with m1:
+            quote["eps"] = st.number_input(
+                "EPS TTM", step=0.01, format="%.2f",
+                key=f"epsttm_in_{tok}", **_default_kw(f"epsttm_in_{tok}", float(quote["eps"] or 0.0)),
+            )
+        with m2:
+            quote["pe"] = st.number_input(
+                "Current P/E", step=0.1, format="%.1f",
+                key=f"pettm_in_{tok}", **_default_kw(f"pettm_in_{tok}", float(quote["pe"] or 0.0)),
+            )
+        quote["price"] = st.number_input(
+            "Current Price ($)", min_value=0.0, step=0.01, format="%.2f",
+            key=f"curprice_in_{tok}", **_default_kw(f"curprice_in_{tok}", float(quote["price"] or 0.0)),
+        )
+        if not live:
+            note = (
+                f"Showing the last successful fetch (from {cache_age[11:16]}) since live data "
+                "didn't come through this time — all three fields above are editable if you'd rather "
+                "enter fresher numbers yourself."
+            ) if cache_age else (
+                "Auto-fetch didn't come through this time — the three fields above are all editable, "
+                "so you can fill them in yourself and the rest of the tool works exactly the same."
+            )
+            st.markdown(f"<span class='small-note'>{note}</span>", unsafe_allow_html=True)
 
         cagr_df = pd.DataFrame({
             "CAGR": ["Revenue", "EPS"],
@@ -615,12 +744,12 @@ with left:
         })
 
         def _cagr_color(v):
-            if v is None or (isinstance(v, float) and pd.isna(v)):
+            if v is None or pd.isna(v):
                 return "color:#9aa1ac"
             return f"color:{GREEN if v >= 0 else RED}; font-weight:700; text-shadow:{'0 0 8px ' + GLOW if v >= 0 else 'none'}"
 
         def _cagr_fmt(v):
-            return "—" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{v * 100:+.1f}%"
+            return "—" if v is None or pd.isna(v) else f"{v * 100:+.1f}%"
 
         styled = cagr_df.style.map(_cagr_color, subset=["1Y", "3Y", "4Y"]).format(_cagr_fmt, subset=["1Y", "3Y", "4Y"])
         st.dataframe(styled, hide_index=True)  # width already defaults to 'stretch'
@@ -732,77 +861,80 @@ def _rounded_rect_path(x0, y0, x1, y1, rx, ry):
 
 with st.container(border=True, key="chart-card"):
     st.markdown(f"##### Projected Stock Price — {quote['ticker']}")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=labels, y=prices_low, mode="lines+markers", name=f"P/E {pe_low_val:.1f} (low)",
-        line=dict(color="#94A3B8", width=3, shape="spline", smoothing=0.4),
-        marker=dict(size=7, color="#ffffff", line=dict(color="#94A3B8", width=2)),
-        hovertemplate="%{x}<br>P/E low: <b>$%{y:,.2f}</b><extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=labels, y=prices_high, mode="lines+markers", name=f"P/E {pe_high_val:.1f} (high)",
-        line=dict(color=GREEN_BRIGHT, width=4, shape="spline", smoothing=0.4),
-        marker=dict(size=8, color="#ffffff", line=dict(color=GREEN_BRIGHT, width=2.5)),
-        fill="tonexty", fillcolor="rgba(22,163,74,0.10)",
-        hovertemplate="%{x}<br>P/E high: <b>$%{y:,.2f}</b><extra></extra>",
-    ))
+    if not quote["price"] or quote["price"] <= 0:
+        st.info("Enter a Current Price in Current Metrics to see the projection chart.")
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=labels, y=prices_low, mode="lines+markers", name=f"P/E {pe_low_val:.1f} (low)",
+            line=dict(color="#94A3B8", width=3, shape="spline", smoothing=0.4),
+            marker=dict(size=7, color="#ffffff", line=dict(color="#94A3B8", width=2)),
+            hovertemplate="%{x}<br>P/E low: <b>$%{y:,.2f}</b><extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=labels, y=prices_high, mode="lines+markers", name=f"P/E {pe_high_val:.1f} (high)",
+            line=dict(color=GREEN_BRIGHT, width=4, shape="spline", smoothing=0.4),
+            marker=dict(size=8, color="#ffffff", line=dict(color=GREEN_BRIGHT, width=2.5)),
+            fill="tonexty", fillcolor="rgba(22,163,74,0.10)",
+            hovertemplate="%{x}<br>P/E high: <b>$%{y:,.2f}</b><extra></extra>",
+        ))
 
-    all_prices = prices_low + prices_high
-    y_max = max(all_prices) if all_prices else 1
-    y_min = min(all_prices) if all_prices else 0
-    span_est = (y_max - y_min) or (y_max * 0.3 if y_max else 100)
-    badge_offset = 0.11 * span_est   # vertical gap between a point and its badge, in price $
-    badge_half_h = 0.030 * span_est  # badge height, in price $ — scales with the chart's own range
+        all_prices = prices_low + prices_high
+        y_max = max(all_prices) if all_prices else 1
+        y_min = min(all_prices) if all_prices else 0
+        span_est = (y_max - y_min) or (y_max * 0.3 if y_max else 100)
+        badge_offset = 0.11 * span_est   # vertical gap between a point and its badge, in price $
+        badge_half_h = 0.030 * span_est  # badge height, in price $ — scales with the chart's own range
 
-    def _badge(x_idx, y_price, text, above=True):
-        half_w = 0.11 + 0.037 * len(text)  # data-x units — scales with digit count, not fixed
-        cy = y_price + (badge_offset if above else -badge_offset)
-        fig.add_shape(
-            type="path",
-            path=_rounded_rect_path(x_idx - half_w, cy - badge_half_h, x_idx + half_w, cy + badge_half_h,
-                                     0.05, badge_half_h * 0.4),
-            xref="x", yref="y", fillcolor=INK, line=dict(width=0),
+        def _badge(x_idx, y_price, text, above=True):
+            half_w = 0.11 + 0.037 * len(text)  # data-x units — scales with digit count, not fixed
+            cy = y_price + (badge_offset if above else -badge_offset)
+            fig.add_shape(
+                type="path",
+                path=_rounded_rect_path(x_idx - half_w, cy - badge_half_h, x_idx + half_w, cy + badge_half_h,
+                                         0.05, badge_half_h * 0.4),
+                xref="x", yref="y", fillcolor=INK, line=dict(width=0),
+            )
+            fig.add_annotation(
+                x=x_idx, y=cy, xref="x", yref="y", text=text, showarrow=False,
+                xanchor="center", yanchor="middle",
+                font=dict(color="#ffffff", size=12, family="Space Grotesk", weight="bold"),
+            )
+
+        # Year 0 is identical on both lines (today's actual price) — one shared
+        # badge. After that, low/high diverge, so each gets its own badge on
+        # opposite sides of the line to keep the two from colliding.
+        _badge(0, prices_high[0], f"${prices_high[0]:,.0f}", above=True)
+        for i in range(1, years + 1):
+            _badge(i, prices_high[i], f"${prices_high[i]:,.0f}", above=True)
+            _badge(i, prices_low[i], f"${prices_low[i]:,.0f}", above=False)
+
+        # Range follows the badges' own real extents (not a separate estimate),
+        # so nothing can end up outside it — including in a steep-decline
+        # scenario where a badge would otherwise sit below a $0-clamped floor.
+        top_extent = y_max + badge_offset + badge_half_h
+        bottom_extent = y_min - badge_offset - badge_half_h
+        y_range = [bottom_extent - abs(bottom_extent) * 0.04, top_extent * 1.04]
+
+        fig.update_layout(
+            height=460,
+            margin=dict(l=20, r=70, t=45, b=35),
+            plot_bgcolor="white", paper_bgcolor="white",
+            xaxis=dict(
+                showgrid=True, gridcolor="#eef0f4", title="",
+                tickfont=dict(color=INK, size=13, family="Inter", weight="bold"),
+            ),
+            yaxis=dict(
+                side="right", showgrid=True, gridcolor="#eef0f4",
+                tickprefix="$", tickformat=",.0f", color=GREEN_BRIGHT,
+                range=y_range,
+            ),
+            font=dict(color=INK, family="Inter"),
+            hovermode="x unified",
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        fig.add_annotation(
-            x=x_idx, y=cy, xref="x", yref="y", text=text, showarrow=False,
-            xanchor="center", yanchor="middle",
-            font=dict(color="#ffffff", size=12, family="Space Grotesk", weight="bold"),
-        )
-
-    # Year 0 is identical on both lines (today's actual price) — one shared
-    # badge. After that, low/high diverge, so each gets its own badge on
-    # opposite sides of the line to keep the two from colliding.
-    _badge(0, prices_high[0], f"${prices_high[0]:,.0f}", above=True)
-    for i in range(1, years + 1):
-        _badge(i, prices_high[i], f"${prices_high[i]:,.0f}", above=True)
-        _badge(i, prices_low[i], f"${prices_low[i]:,.0f}", above=False)
-
-    # Range follows the badges' own real extents (not a separate estimate),
-    # so nothing can end up outside it — including in a steep-decline
-    # scenario where a badge would otherwise sit below a $0-clamped floor.
-    top_extent = y_max + badge_offset + badge_half_h
-    bottom_extent = y_min - badge_offset - badge_half_h
-    y_range = [bottom_extent - abs(bottom_extent) * 0.04, top_extent * 1.04]
-
-    fig.update_layout(
-        height=460,
-        margin=dict(l=20, r=70, t=45, b=35),
-        plot_bgcolor="white", paper_bgcolor="white",
-        xaxis=dict(
-            showgrid=True, gridcolor="#eef0f4", title="",
-            tickfont=dict(color=INK, size=13, family="Inter", weight="bold"),
-        ),
-        yaxis=dict(
-            side="right", showgrid=True, gridcolor="#eef0f4",
-            tickprefix="$", tickformat=",.0f", color=GREEN_BRIGHT,
-            range=y_range,
-        ),
-        font=dict(color=INK, family="Inter"),
-        hovermode="x unified",
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig)  # width already defaults to 'stretch'
+        st.plotly_chart(fig)  # width already defaults to 'stretch'
 
     if target_buy_price is not None:
         years_word = "year" if years == 1 else "years"
