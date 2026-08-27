@@ -140,11 +140,22 @@ button[kind="primary"]:hover {{ background:#282b3a !important; border-color:#282
 .margin-strip strong {{ font-family:'Space Grotesk',sans-serif; font-weight:700; }}
 
 @media (max-width: 640px) {{
-    .block-container {{ padding-left:0.8rem; padding-right:0.8rem; padding-top:1rem; }}
-    .hero-name {{ font-size:16px; }}
-    .hero-price {{ font-size:23px; }}
-    .result-value {{ font-size:19px; }}
-    [data-testid="stMetricValue"] {{ font-size:1.35rem; }}
+    .block-container {{ padding-left:0.7rem; padding-right:0.7rem; padding-top:0.8rem; }}
+    .hero-name {{ font-size:15.5px; }}
+    .hero-ticker {{ font-size:11px; padding:1px 6px; }}
+    .hero-price {{ font-size:22px; }}
+    .hero-status {{ font-size:11.5px; }}
+    .result-value {{ font-size:17px; }}
+    .result-label {{ font-size:11.5px; margin-bottom:3px; }}
+    [data-testid="stMetricValue"] {{ font-size:1.25rem; }}
+    [data-testid="stMetricLabel"] {{ font-size:0.78rem; }}
+    .st-key-metrics-card, .st-key-inputs-card, .st-key-chart-card,
+    .st-key-result-eps, .st-key-result-price, .st-key-result-annual,
+    .st-key-result-total-pos, .st-key-result-total-neg {{
+        padding:14px 14px !important;
+    }}
+    .margin-strip {{ font-size:12.5px; padding:11px 13px; }}
+    .small-note {{ font-size:11.5px; }}
 }}
 </style>
 """, unsafe_allow_html=True)
@@ -528,6 +539,21 @@ def fmt_pct_range(lo, hi):
     return f"{fmt_pct(lo)} – {fmt_pct(hi)}" if abs(hi - lo) > 0.0005 else fmt_pct(lo)
 
 
+def is_mobile() -> bool:
+    """True only for an actual phone (User-Agent sniffing), not just a
+    narrow desktop window — so simplifications made here are scoped to
+    'this is a phone' specifically, as asked, rather than to viewport width
+    the way a CSS media query alone would be."""
+    try:
+        ua = st.context.headers.get("User-Agent", "")
+        return bool(re.search(r"Mobi|iPhone|Android|IEMobile|BlackBerry", ua, re.IGNORECASE))
+    except Exception:
+        return False
+
+
+MOBILE = is_mobile()
+
+
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -705,7 +731,7 @@ years = st.slider("Projection horizon", 1, 10, key="years", format="%d years")
 # ---------------------------------------------------------------------------
 # Two-column cards
 # ---------------------------------------------------------------------------
-left, right = st.columns(2, gap="large")
+left, right = st.columns(2, gap="small" if MOBILE else "large")
 
 with left:
     with st.container(border=True, key="metrics-card"):
@@ -869,14 +895,14 @@ with st.container(border=True, key="chart-card"):
             x=labels, y=prices_low, mode="lines+markers", name=f"P/E {pe_low_val:.1f} (low)",
             line=dict(color="#94A3B8", width=3, shape="spline", smoothing=0.4),
             marker=dict(size=7, color="#ffffff", line=dict(color="#94A3B8", width=2)),
-            hovertemplate="%{x}<br>P/E low: <b>$%{y:,.2f}</b><extra></extra>",
+            hoverinfo="skip",
         ))
         fig.add_trace(go.Scatter(
             x=labels, y=prices_high, mode="lines+markers", name=f"P/E {pe_high_val:.1f} (high)",
             line=dict(color=GREEN_BRIGHT, width=4, shape="spline", smoothing=0.4),
             marker=dict(size=8, color="#ffffff", line=dict(color=GREEN_BRIGHT, width=2.5)),
             fill="tonexty", fillcolor="rgba(22,163,74,0.10)",
-            hovertemplate="%{x}<br>P/E high: <b>$%{y:,.2f}</b><extra></extra>",
+            hoverinfo="skip",
         ))
 
         all_prices = prices_low + prices_high
@@ -898,14 +924,19 @@ with st.container(border=True, key="chart-card"):
             fig.add_annotation(
                 x=x_idx, y=cy, xref="x", yref="y", text=text, showarrow=False,
                 xanchor="center", yanchor="middle",
-                font=dict(color="#ffffff", size=12, family="Space Grotesk", weight="bold"),
+                font=dict(color="#ffffff", size=11 if MOBILE else 12, family="Space Grotesk", weight="bold"),
             )
 
         # Year 0 is identical on both lines (today's actual price) — one shared
         # badge. After that, low/high diverge, so each gets its own badge on
-        # opposite sides of the line to keep the two from colliding.
+        # opposite sides of the line to keep the two from colliding. On a
+        # phone specifically, skip alternating years once there are more
+        # than 4 (keeping the first and last) — same data, less clutter.
+        skip = 2 if (MOBILE and years > 4) else 1
         _badge(0, prices_high[0], f"${prices_high[0]:,.0f}", above=True)
         for i in range(1, years + 1):
+            if i % skip != 0 and i != years:
+                continue
             _badge(i, prices_high[i], f"${prices_high[i]:,.0f}", above=True)
             _badge(i, prices_low[i], f"${prices_low[i]:,.0f}", above=False)
 
@@ -917,24 +948,28 @@ with st.container(border=True, key="chart-card"):
         y_range = [bottom_extent - abs(bottom_extent) * 0.04, top_extent * 1.04]
 
         fig.update_layout(
-            height=460,
-            margin=dict(l=20, r=70, t=45, b=35),
+            height=340 if MOBILE else 460,
+            margin=dict(l=10 if MOBILE else 20, r=52 if MOBILE else 70, t=40, b=30 if MOBILE else 35),
             plot_bgcolor="white", paper_bgcolor="white",
             xaxis=dict(
                 showgrid=True, gridcolor="#eef0f4", title="",
-                tickfont=dict(color=INK, size=13, family="Inter", weight="bold"),
+                tickfont=dict(color=INK, size=11 if MOBILE else 13, family="Inter", weight="bold"),
             ),
             yaxis=dict(
                 side="right", showgrid=True, gridcolor="#eef0f4",
                 tickprefix="$", tickformat=",.0f", color=GREEN_BRIGHT,
+                tickfont=dict(size=10 if MOBILE else 12),
                 range=y_range,
             ),
             font=dict(color=INK, family="Inter"),
-            hovermode="x unified",
+            hovermode=False,
             showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                font=dict(size=10 if MOBILE else 12),
+            ),
         )
-        st.plotly_chart(fig)  # width already defaults to 'stretch'
+        st.plotly_chart(fig, config={"displayModeBar": False})  # width already defaults to 'stretch'
 
     if target_buy_price is not None:
         years_word = "year" if years == 1 else "years"
